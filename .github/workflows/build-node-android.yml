@@ -1,0 +1,128 @@
+# Build Node.js for Android (aarch64, bionic)
+#
+# Builds a standalone `node` + `npm` that RUNS on Android (bionic libc),
+# for Coder V2 / Linvel IDE. The official linux-arm64 downloads are glibc
+# and cannot run on Android, so this builds from source with the NDK.
+#
+# Recipe: upstream Node `android-configure` + NDK r28c, API 24, arm64,
+# --with-intl=small-icu, --v8-disable-temporal-support (removes the Rust
+# requirement for Node 26), 16 KB page alignment.
+# Run it: Actions tab -> this workflow -> Run workflow.
+# Output: artifact `node-26.12.1-android-arm64` (a .zip with bin/node,
+# bin/npm, lib/node_modules, and libc++_shared.so).
+
+name: Build Node.js for Android (aarch64)
+
+on:
+  workflow_dispatch:
+
+env:
+  NODE_VERSION: "26.12.1"
+  NDK_VERSION: "r28c"
+  ANDROID_API: "24"
+
+jobs:
+  build-node-android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Free disk space (standard runners only have 14 GB)
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost \
+            /opt/hostedtoolcache/CodeQL /usr/lib/jvm
+          sudo apt-get clean
+          df -h
+
+      - name: Install host build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential python3 ninja-build \
+            pkg-config file binutils curl xz-utils zip
+
+      - name: Download Android NDK r28c
+        run: |
+          set -euo pipefail
+          cd "$HOME"
+          curl -sSLO "https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip"
+          unzip -q "android-ndk-${NDK_VERSION}-linux.zip"
+          ls "$HOME/android-ndk-${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${ANDROID_API}-clang"
+
+      - name: Download Node.js source
+        run: |
+          set -euo pipefail
+          curl -sSLO "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}.tar.xz"
+          tar xf "node-v${NODE_VERSION}.tar.xz"
+          ls "node-v${NODE_VERSION}/android-configure"
+
+      - name: Configure and build Node for Android
+        # v3: configure ONCE. v2 ran ./configure twice (once inside
+        # android-configure with defaults, once here with the real flags)
+        # and the second generation came out with a duplicated ninja rule
+        # ("multiple rules generate .../js_protocol.stamp"), so ninja died
+        # before compiling anything. android-configure is only used for its
+        # patch step now; CC/CXX/GYP_DEFINES are exported here verbatim
+        # from android_configure.py in Node 26.12.1.
+        run: |
+          set -euo pipefail
+          export NDK="$HOME/android-ndk-${NDK_VERSION}"
+          cd "node-v${NODE_VERSION}"
+          ./android-configure patch
+          export PATH="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
+          export CC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${ANDROID_API}-clang"
+          export CXX="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${ANDROID_API}-clang++"
+          export GYP_DEFINES="target_arch=arm64 v8_target_arch=arm64 android_target_arch=arm64 host_os=linux OS=android android_ndk_path=$NDK"
+          ./configure --dest-cpu=arm64 --dest-os=android --cross-compiling \
+            --openssl-no-asm --with-intl=small-icu --v8-disable-temporal-support \
+            --ninja --prefix="$PWD/staging"
+          LDFLAGS="-Wl,-z,max-page-size=16384" ninja -C out/Release -j4
+          ls -l out/Release/node
+
+      - name: Verify the binary is bionic, not glibc
+        # This is the gate. A glibc binary (interpreter /lib/ld-linux) cannot
+        # run on Android. The job FAILS if the check fails.
+        run: |
+          set -euo pipefail
+          cd "node-v${NODE_VERSION}"
+          FILE_OUT="$(file out/Release/node)"
+          echo "$FILE_OUT"
+          case "$FILE_OUT" in
+            *"/system/bin/linker64"*) echo "interpreter OK: bionic linker64" ;;
+            *) echo "FAIL: node is not a bionic binary"; exit 1 ;;
+          esac
+          case "$FILE_OUT" in
+            *"ld-linux"*) echo "FAIL: glibc-linked binary"; exit 1 ;;
+          esac
+          echo "--- NEEDED libraries ---"
+          readelf -d out/Release/node | grep NEEDED
+          echo "--- LOAD segment alignment (want 0x4000 for 16 KB pages) ---"
+          readelf -lW out/Release/node | grep LOAD || true
+
+      - name: Package node + npm + libc++_shared.so
+        run: |
+          set -euo pipefail
+          export NDK="$HOME/android-ndk-${NDK_VERSION}"
+          cd "node-v${NODE_VERSION}"
+          python3 tools/install.py install --prefix "$PWD/staging" --build-dir out/Release
+          test -x staging/bin/node || { echo "FAIL: no node in staging/bin"; exit 1; }
+          test -f staging/bin/npm || { echo "FAIL: no npm in staging/bin"; exit 1; }
+          cp "$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" staging/lib/
+          cat > staging/README-ANDROID.txt <<'EOF'
+          Node.js 26.12.1 for Android aarch64 (bionic), built from source with NDK r28c, API 24.
+          Contents: bin/node, bin/npm (+ bin/npx, bin/corepack), lib/node_modules, libc++_shared.so.
+          The binary links libc++_shared.so: keep that file next to it (same dir as node,
+          or set LD_LIBRARY_PATH to the dir holding it) or node will not start.
+          On-device, ship node as an APK-native .so (Route C) — Android 10+ will not
+          exec binaries from the app data dir.
+          EOF
+          ls -R staging/bin staging/lib | head -30
+          (cd staging && zip -qr "$GITHUB_WORKSPACE/node-${NODE_VERSION}-android-arm64.zip" .)
+          ls -lh "$GITHUB_WORKSPACE/node-${NODE_VERSION}-android-arm64.zip"
+          du -sh "$GITHUB_WORKSPACE/node-${NODE_VERSION}-android-arm64.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-26.12.1-android-arm64
+          path: node-26.12.1-android-arm64.zip
+          retention-days: 90
